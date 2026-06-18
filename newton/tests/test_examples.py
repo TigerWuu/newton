@@ -605,6 +605,17 @@ add_example_test(
 
 add_example_test(
     TestDiffSimExamples,
+    name="diffsim.example_diffsim_so101_sysid",
+    devices=test_devices,
+    # rollouts are replayed every 8 train iters, 30 frames each; 11 replays
+    # require the >= 80 train iters needed for the identification asserts
+    test_options={"num-frames": 11 * 30},
+    test_options_cpu={"num-frames": 8, "sim-duration": 0.25},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestDiffSimExamples,
     name="diffsim.example_diffsim_spring_cage",
     devices=test_devices,
     test_options={"num-frames": 4 * 30},  # train_iters * sim_steps
