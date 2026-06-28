@@ -70,7 +70,7 @@ import newton.examples
 # Default location of the recorded chirp trajectory (the "all joints at once"
 # run). Override with --data. Kept as a convenience for the author's setup; the
 # example errors clearly if the file is missing.
-DEFAULT_DATA = os.path.expanduser("~/Downloads/id/outputs/chirp_traj/20260616_133149/chirp_06_all_joints.csv")
+DEFAULT_DATA = os.path.expanduser("./newton/examples/diffsim/gt/chirp_traj/20260616_133149/chirp_06_all_joints.csv")
 
 # Base file name for the saved trajectory plots (under ``--plot-dir``).
 PLOT_BASENAME = "sysid_true_trajectories"
@@ -433,6 +433,7 @@ class Example:
             for i in range(self.window_len):
                 for s in range(self.sim_substeps):
                     t = i * self.sim_substeps + s
+                    # put target command input into the joint_target_q array
                     wp.launch(
                         set_target_kernel,
                         dim=self.dof_count,
@@ -445,7 +446,9 @@ class Example:
                         inputs=[states[t].joint_qd, self.friction_param, self.friction_vel_eps],
                         outputs=[controls[t].joint_f],
                     )
+                    # run physics solver for one time step with the target command
                     self.solver.step(states[t], states[t + 1], controls[t], None, self.sim_dt)
+                # compute loss for this window
                 wp.launch(
                     trajectory_loss_kernel,
                     dim=len(self.arm_dof_list),
@@ -507,6 +510,7 @@ class Example:
         self._print_comparison(nominal, identified)
         self._save_parameters_csv(nominal, identified, os.path.join(self.plot_dir, "identified_parameters.csv"))
         if self.make_plot:
+            self._plot_loss_curve(os.path.join(self.plot_dir, "loss_curve.png"))
             identified_traj = self.save_trajectory_plot(f"_iter{self.train_iter:05d}_final")
             if self.animate:
                 self._save_animation(identified_traj, os.path.join(self.plot_dir, "validation_animation.gif"))
@@ -744,6 +748,42 @@ class Example:
                 s0, s1 = s1, s0
             traj[f] = s0.joint_q.numpy()
         return traj
+
+    def _plot_loss_curve(self, path):
+        """Plot the per-iteration trajectory loss over the whole training run."""
+        try:
+            import matplotlib.pyplot as plt  # noqa: PLC0415
+        except ImportError:
+            print("matplotlib not available; skipping loss curve plot.")
+            return
+        if not self.loss_history:
+            return
+
+        loss = np.array(self.loss_history)
+        iters = np.arange(len(loss))
+        rmse_deg = np.rad2deg(np.sqrt(loss))
+
+        fig, ax_loss = plt.subplots(figsize=(8, 4.5))
+        ax_loss.plot(iters, loss, color="tab:blue", lw=1.4)
+        ax_loss.set_yscale("log")
+        ax_loss.set_xlabel("optimizer step")
+        ax_loss.set_ylabel("trajectory loss [rad$^2$]", color="tab:blue")
+        ax_loss.tick_params(axis="y", labelcolor="tab:blue")
+        ax_loss.grid(True, which="both", alpha=0.3)
+
+        # secondary axis in the more interpretable window RMSE [deg]
+        ax_rmse = ax_loss.twinx()
+        ax_rmse.plot(iters, rmse_deg, color="tab:orange", lw=1.0, alpha=0.0)
+        ax_rmse.set_ylabel("window rmse [deg]", color="tab:orange")
+        ax_rmse.set_yscale("log")
+        ax_rmse.set_ylim(np.rad2deg(np.sqrt(ax_loss.get_ylim())))
+        ax_rmse.tick_params(axis="y", labelcolor="tab:orange")
+
+        ax_loss.set_title(f"SO-101 system identification: training loss ({len(loss)} steps)")
+        fig.tight_layout()
+        fig.savefig(path, dpi=130)
+        plt.close(fig)
+        print(f"loss curve saved to {path}")
 
     def _plot(self, measured, nominal_traj, identified_traj, path):
         try:
