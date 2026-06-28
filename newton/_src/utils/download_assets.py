@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import gc
 import hashlib
 import os
 import re
@@ -49,13 +50,20 @@ def _safe_rmtree(path):
         shutil.rmtree(path, onerror=_handle_remove_readonly)
 
 
-def _safe_rename(src, dst, attempts=5, delay=0.1):
+def _safe_rename(src, dst, attempts=12, delay=0.1, max_delay=2.0):
     """Rename src to dst, tolerating races where another process wins.
 
     If *dst* already exists (``FileExistsError`` or ``ENOTEMPTY``), the call
     returns silently — the caller should clean up *src*.  Transient OS errors
-    (e.g. Windows file-lock contention) are retried up to *attempts* times.
+    are retried with exponential backoff.  On Windows a freshly written
+    download directory is often briefly locked by a lingering git subprocess
+    (background ``gc``/maintenance) or by antivirus scanning the new files,
+    surfacing as ``WinError 32`` (ERROR_SHARING_VIOLATION); the lock can
+    outlast a short retry window.  If every retry fails, fall back to copying
+    the working tree (the lock is on ``.git``, which the cache never needs) so
+    the download still completes.  The caller removes *src* afterwards.
     """
+    last_error = None
     for i in range(attempts):
         try:
             os.rename(src, dst)
@@ -65,10 +73,19 @@ def _safe_rename(src, dst, attempts=5, delay=0.1):
         except OSError as e:
             if e.errno == errno.ENOTEMPTY:
                 return
+            last_error = e
             if i < attempts - 1:
-                time.sleep(delay)
-            else:
-                raise
+                # Drop any GitPython handles still referencing files in *src*
+                # so the OS can release the lock before the next attempt.
+                gc.collect()
+                time.sleep(min(delay * (2**i), max_delay))
+
+    try:
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+    except FileExistsError:
+        pass
+    except OSError:
+        raise last_error from None
 
 
 def _temp_cache_path(final_dir: Path) -> Path:
@@ -403,8 +420,14 @@ def download_git_folder(
         _safe_rename(temp_dir, final_dir)
 
         if temp_dir.exists():
-            # Another process already placed this exact version — use theirs
-            _safe_rmtree(temp_dir)
+            # *temp_dir* survives when another process won the rename race, or
+            # when _safe_rename fell back to copying because the tree was
+            # locked.  Removal is best-effort: a still-locked .git is harmless
+            # and gets swept later by _cleanup_stale_temp_dirs.
+            try:
+                _safe_rmtree(temp_dir)
+            except OSError:
+                pass
 
         # Set mtime to now for TTL tracking
         os.utime(final_dir, None)
