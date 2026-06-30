@@ -14,7 +14,9 @@
 #
 #   1. Teleop control (shared with ``example_robot_so101_teleop``): the
 #      keyboard moves a target pose for the gripper, an IK solver converts it
-#      into joint position targets, and the MuJoCo solver tracks them.
+#      into joint position targets, and SolverFeatherstone tracks them -- the
+#      same solver, substep count, and friction model used to fit the
+#      identified parameters, so the twin reproduces those conditions exactly.
 #
 #   2. A real-hardware bridge. The same joint targets that drive the
 #      simulation are streamed to the physical SO-101 at 50 Hz through the
@@ -217,6 +219,22 @@ class SO101Hardware:
 
 
 @wp.kernel
+def friction_torque_kernel(
+    joint_qd: wp.array[wp.float32],
+    friction: wp.array[wp.float32],
+    vel_eps: wp.float32,
+    # output
+    joint_f: wp.array[wp.float32],
+):
+    # Coulomb joint friction, applied as a generalized force exactly as in the
+    # identification (example_diffsim_so101_sysid_true.friction_torque_kernel):
+    # SolverFeatherstone does not read Model.joint_friction, and the parameters
+    # were fit against this smoothed -friction*tanh(qd/vel_eps) torque.
+    tid = wp.tid()
+    joint_f[tid] = -friction[tid] * wp.tanh(joint_qd[tid] / vel_eps)
+
+
+@wp.kernel
 def assign_joint_targets_kernel(
     ik_joint_q: wp.array2d[wp.float32],
     jaw_target: wp.array[wp.float32],
@@ -241,8 +259,12 @@ class Example:
         self.fps = 50
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 10
+        # match the identification rollout (SolverFeatherstone, 4 substeps) so
+        # the identified parameters reproduce the same discretized dynamics
+        self.sim_substeps = max(int(args.substeps), 1)
         self.sim_dt = self.frame_dt / self.sim_substeps
+        # smoothing width of the Coulomb friction model, identical to the sysid
+        self.friction_vel_eps = 0.1
 
         self.viewer = viewer
         self.device = wp.get_device()
@@ -264,7 +286,6 @@ class Example:
         print(f"loaded identified parameters from {params_path}")
 
         builder = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
 
         # the USD already contains joint drives (stiffness, damping, effort
         # limits), which add_usd() imports as position-control targets
@@ -308,7 +329,7 @@ class Example:
 
         self.model = builder.finalize()
 
-        self.solver = newton.solvers.SolverMuJoCo(self.model)
+        self.solver = newton.solvers.SolverFeatherstone(self.model)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -439,6 +460,16 @@ class Example:
 
             # apply forces to the model for picking, wind, etc
             self.viewer.apply_forces(self.state_0)
+
+            # identified Coulomb friction, recomputed from the current joint
+            # velocity each substep (Featherstone reads it via Control.joint_f)
+            wp.launch(
+                friction_torque_kernel,
+                dim=self.model.joint_dof_count,
+                inputs=[self.state_0.joint_qd, self.model.joint_friction, self.friction_vel_eps],
+                outputs=[self.control.joint_f],
+                device=self.device,
+            )
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
@@ -577,6 +608,12 @@ class Example:
             type=float,
             default=0.1,
             help="Reflected servo rotor inertia, matching the identification setup.",
+        )
+        parser.add_argument(
+            "--substeps",
+            type=int,
+            default=4,
+            help="Simulation substeps per control frame, matching the identification setup.",
         )
         parser.add_argument(
             "--hardware",
