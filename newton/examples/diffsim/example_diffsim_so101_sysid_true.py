@@ -312,13 +312,23 @@ class Example:
         self.body_mass_ref = wp.clone(self.model.body_mass, requires_grad=False)
         self.body_inertia_ref = wp.clone(self.model.body_inertia, requires_grad=False)
 
-        # parameters to identify
-        self.ke_param = wp.full(self.dof_count, self.init_ke, dtype=float, requires_grad=True)
-        self.kd_param = wp.full(self.dof_count, self.init_kd, dtype=float, requires_grad=True)
-        self.damping_param = wp.zeros(self.dof_count, dtype=float, requires_grad=True)
-        self.friction_param = wp.zeros(self.dof_count, dtype=float, requires_grad=True)
-        self.mass_scale = wp.ones(self.model.body_count, dtype=float, requires_grad=True)
-        self.inertia_scale = wp.ones(self.model.body_count, dtype=float, requires_grad=True)
+        # parameters to identify, initialized to the nominal baseline. With
+        # --resume they instead continue from the ``identified`` column of a
+        # previously saved identified_parameters.csv.
+        ke0 = np.full(self.dof_count, self.init_ke, dtype=np.float32)
+        kd0 = np.full(self.dof_count, self.init_kd, dtype=np.float32)
+        damping0 = np.zeros(self.dof_count, dtype=np.float32)
+        friction0 = np.zeros(self.dof_count, dtype=np.float32)
+        mass_scale0 = np.ones(self.model.body_count, dtype=np.float32)
+        inertia_scale0 = np.ones(self.model.body_count, dtype=np.float32)
+        if args.resume:
+            self._load_parameters_csv(args.resume, ke0, kd0, damping0, friction0, mass_scale0, inertia_scale0)
+        self.ke_param = wp.array(ke0, dtype=float, requires_grad=True)
+        self.kd_param = wp.array(kd0, dtype=float, requires_grad=True)
+        self.damping_param = wp.array(damping0, dtype=float, requires_grad=True)
+        self.friction_param = wp.array(friction0, dtype=float, requires_grad=True)
+        self.mass_scale = wp.array(mass_scale0, dtype=float, requires_grad=True)
+        self.inertia_scale = wp.array(inertia_scale0, dtype=float, requires_grad=True)
 
         # --- map recorded data into the USD joint frame [rad] ------------
         cmd_rad = np.zeros((self.num_frames, self.dof_count), dtype=np.float32)
@@ -582,6 +592,9 @@ class Example:
                 )
             )
             rows.append(
+                ("link", bname, "mass_scale", "-", nominal["mass_scale"][b], identified["mass_scale"][b])
+            )
+            rows.append(
                 ("link", bname, "inertia_scale", "-", nominal["inertia_scale"][b], identified["inertia_scale"][b])
             )
         with open(path, "w", newline="") as f:
@@ -589,6 +602,32 @@ class Example:
             for row in rows:
                 writer.writerow([f"{v:.6g}" if isinstance(v, (float, np.floating)) else v for v in row])
         print(f"identified parameters saved to {path}")
+
+    def _load_parameters_csv(self, path, ke, kd, damping, friction, mass_scale, inertia_scale):
+        """Overwrite the starting parameter arrays in place from the ``identified``
+        column of a CSV written by :meth:`_save_parameters_csv`, so training
+        resumes from those values. Entries absent from the file keep their
+        nominal defaults; the redundant ``mass`` link rows are ignored in favor
+        of ``mass_scale``.
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"--resume file not found: {path}")
+        name_to_dof = dict(zip(CSV_JOINT_TO_USD.values(), self.arm_dof_list, strict=True))
+        name_to_body = {label.rsplit("/", 1)[-1]: b for b, label in enumerate(self.model.body_label)}
+        joint_targets = {"target_ke": ke, "target_kd": kd, "damping": damping, "friction": friction}
+        link_targets = {"mass_scale": mass_scale, "inertia_scale": inertia_scale}
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                category = row["category"] 
+                name = row["name"]
+                parameter = row["parameter"]
+                value = float(row["identified"])
+
+                if category == "joint" and parameter in joint_targets and name in name_to_dof:
+                    joint_targets[parameter][name_to_dof[name]] = value
+                elif category == "link" and parameter in link_targets and name in name_to_body:
+                    link_targets[parameter][name_to_body[name]] = value
+        print(f"resuming from identified parameters in {path}")
 
     def _save_animation(self, identified_traj, path):
         """Save a GIF overlaying two arms: one driven by the identified-parameter
@@ -765,18 +804,15 @@ class Example:
 
         fig, ax_loss = plt.subplots(figsize=(8, 4.5))
         ax_loss.plot(iters, loss, color="tab:blue", lw=1.4)
-        ax_loss.set_yscale("log")
         ax_loss.set_xlabel("optimizer step")
         ax_loss.set_ylabel("trajectory loss [rad$^2$]", color="tab:blue")
         ax_loss.tick_params(axis="y", labelcolor="tab:blue")
-        ax_loss.grid(True, which="both", alpha=0.3)
+        ax_loss.grid(True, alpha=0.3)
 
         # secondary axis in the more interpretable window RMSE [deg]
         ax_rmse = ax_loss.twinx()
-        ax_rmse.plot(iters, rmse_deg, color="tab:orange", lw=1.0, alpha=0.0)
+        ax_rmse.plot(iters, rmse_deg, color="tab:orange", lw=1.0)
         ax_rmse.set_ylabel("window rmse [deg]", color="tab:orange")
-        ax_rmse.set_yscale("log")
-        ax_rmse.set_ylim(np.rad2deg(np.sqrt(ax_loss.get_ylim())))
         ax_rmse.tick_params(axis="y", labelcolor="tab:orange")
 
         ax_loss.set_title(f"SO-101 system identification: training loss ({len(loss)} steps)")
@@ -801,6 +837,7 @@ class Example:
         fig, axes = plt.subplots(len(arm), 1, figsize=(10, 2.0 * len(arm)), sharex=True)
         for ax, dof, name in zip(axes, arm, arm_names, strict=True):
             meas = np.rad2deg(measured[:, dof])
+            ax.plot(t, np.rad2deg(self._cmd_np[:, dof]), color="tab:green", lw=0.9, ls="--", alpha=0.7, label="commanded")
             ax.plot(t, meas, color="black", lw=1.6, label="measured (ground truth)")
             ax.plot(t, np.rad2deg(identified_traj[:, dof]), color="tab:orange", lw=1.2, label="identified params")
             ax.plot(t, np.rad2deg(nominal_traj[:, dof]), color="0.6", lw=1.0, ls="--", label="nominal CAD params")
@@ -811,7 +848,7 @@ class Example:
             # resonates beyond the model's drive bandwidth and would dominate the axis
             pad = 0.4 * (meas.max() - meas.min()) + 5.0
             ax.set_ylim(meas.min() - pad, meas.max() + pad)
-        axes[0].legend(loc="upper right", fontsize=8, ncol=3)
+        axes[0].legend(loc="upper right", fontsize=8, ncol=4)
         axes[0].set_title(
             f"SO-101 system identification: simulated vs measured joint trajectories "
             f"(iter {self.train_iter}, window rmse {rmse:.2f} deg)"
@@ -896,6 +933,13 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--data", type=str, default=DEFAULT_DATA, help="Path to a recorded chirp CSV.")
+        parser.add_argument(
+            "--resume",
+            type=str,
+            default=None,
+            help="Path to a previously saved identified_parameters.csv to start training from; "
+            "if omitted, training starts from the nominal parameters.",
+        )
         parser.add_argument("--stride", type=int, default=1, help="Decimate the recording by this factor.")
         parser.add_argument("--max-frames", type=int, default=0, help="Cap the number of frames (0 = all).")
         parser.add_argument("--substeps", type=int, default=4, help="Simulation substeps per recorded frame.")
