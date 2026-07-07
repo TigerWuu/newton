@@ -31,7 +31,15 @@
 # scale), so the twin reproduces the measured dynamics rather than the nominal
 # CAD ones.
 #
-# Keys (world frame):
+# Two control modes are available via --mode:
+#
+#   keyboard (default): teleop the gripper target pose with the keys below.
+#   sinewave          : ignore the keyboard and drive every joint (including
+#                       the jaw) with an independent sine wave about its rest
+#                       pose, clamped to the joint limits -- the simulated twin
+#                       and the real arm run the same open-loop command.
+#
+# Keys (world frame, keyboard mode):
 #   I / K : move +X / -X        Z / X : rotate about world X
 #   J / L : move +Y / -Y        C / V : rotate about world Y
 #   U / O : move up / down      B / N : rotate about world Z
@@ -43,6 +51,9 @@
 #   # drive the physical arm too
 #   python -m newton.examples robot_so101_digital_twin \
 #       --robot-port /dev/followerarm-right --robot-id my_awesome_follower_arm
+#   # run the sine-wave excitation on the twin and the real arm
+#   python -m newton.examples robot_so101_digital_twin --mode sinewave \
+#       --sine-amplitude 0.3 --sine-frequency 0.25
 #
 ###########################################################################
 
@@ -53,6 +64,7 @@ import math
 import os
 import time
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -355,6 +367,19 @@ class Example:
         self.jaw_q = float(self.model.joint_q.numpy()[self.jaw_coord])
         self.jaw_target = wp.array([self.jaw_q], dtype=wp.float32, device=self.device)
 
+        # --- sine-wave excitation (--mode sinewave) -----------------------
+        # every joint oscillates about its rest pose; the amplitude is shrunk
+        # and the center shifted where needed so center +/- amplitude always
+        # stays inside the joint limits
+        self.mode = args.mode
+        self.sine_frequency = args.sine_frequency
+        self.sine_amplitude = np.minimum(args.sine_amplitude, 0.9 * 0.5 * (limit_upper - limit_lower))
+        self.sine_center = np.clip(
+            self.model.joint_q.numpy(),
+            limit_lower + self.sine_amplitude,
+            limit_upper - self.sine_amplitude,
+        )
+
         # IK setup: solve for joint coordinates that realize the target pose
         rot = wp.transform_get_rotation(self.target_tf)
         # the arm has only 5 dof, so a 6-dof pose target is generically
@@ -394,6 +419,11 @@ class Example:
         # --- real-hardware bridge ----------------------------------------
         # never touch hardware in the automated test, even if a robot is plugged
         # in: the test runs headless with no operator at the power switch
+        # seed the joint targets so the hardware ease-in below moves to the
+        # sine start pose rather than the imported USD drive targets
+        if self.mode == "sinewave":
+            self._apply_sinewave()
+
         self.hardware = None
         if args.hardware and not args.test:
             self.hardware = SO101Hardware(args.robot_port, args.robot_id, self.fps)
@@ -410,7 +440,13 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(0.7, 0.7, 0.45), pitch=-17.0, yaw=-135.0)
 
-        print(CONTROLS)
+        if self.mode == "sinewave":
+            print(
+                f"sine-wave mode: {self.sine_frequency} Hz, "
+                f"amplitude <= {float(np.max(self.sine_amplitude)):.3f} rad on every joint"
+            )
+        else:
+            print(CONTROLS)
 
         self.capture()
 
@@ -439,21 +475,24 @@ class Example:
             self.graph = capture.graph
 
     def simulate(self):
-        self.ik_solver.step(self.ik_joint_q, self.ik_joint_q, iterations=self.ik_iters)
+        # in sinewave mode the targets are written host-side each frame
+        # (see _apply_sinewave), so the captured graph holds only the substeps
+        if self.mode == "keyboard":
+            self.ik_solver.step(self.ik_joint_q, self.ik_joint_q, iterations=self.ik_iters)
 
-        wp.launch(
-            assign_joint_targets_kernel,
-            dim=self.model.joint_coord_count,
-            inputs=[
-                self.ik_joint_q,
-                self.jaw_target,
-                self.jaw_coord,
-                self.model.joint_limit_lower,
-                self.model.joint_limit_upper,
-            ],
-            outputs=[self.control.joint_target_q],
-            device=self.device,
-        )
+            wp.launch(
+                assign_joint_targets_kernel,
+                dim=self.model.joint_coord_count,
+                inputs=[
+                    self.ik_joint_q,
+                    self.jaw_target,
+                    self.jaw_coord,
+                    self.model.joint_limit_lower,
+                    self.model.joint_limit_upper,
+                ],
+                outputs=[self.control.joint_target_q],
+                device=self.device,
+            )
 
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -483,6 +522,16 @@ class Example:
         self.hardware._sleep_until(self._next_send)
         self._next_send = time.perf_counter() + self.frame_dt
         self.hardware.send(self._hardware_command())
+
+    def _apply_sinewave(self):
+        """Set every joint target to its sine-wave command at the current time.
+
+        The same targets drive the simulation and, via :meth:`_hardware_command`,
+        the physical arm, so twin and hardware execute one open-loop signal.
+        """
+        q = self.sine_center + self.sine_amplitude * math.sin(2.0 * math.pi * self.sine_frequency * self.sim_time)
+        self.jaw_q = float(q[self.jaw_coord])
+        self.control.joint_target_q.assign(q.astype(np.float32))
 
     def _key_axis(self, pos_key: str, neg_key: str) -> float:
         return float(self.viewer.is_key_down(pos_key)) - float(self.viewer.is_key_down(neg_key))
@@ -541,8 +590,11 @@ class Example:
         self.jaw_target.fill_(self.jaw_q)
 
     def step(self):
-        self._apply_keyboard()
-        self._push_targets()
+        if self.mode == "sinewave":
+            self._apply_sinewave()
+        else:
+            self._apply_keyboard()
+            self._push_targets()
 
         if self.graph:
             wp.capture_launch(self.graph)
@@ -557,7 +609,7 @@ class Example:
         self.viewer.begin_frame(self.sim_time)
 
         # the gizmo mutates self.target_tf in place while dragged
-        if hasattr(self.viewer, "log_gizmo"):
+        if self.mode == "keyboard" and hasattr(self.viewer, "log_gizmo"):
             self.viewer.log_gizmo("ee_target", self.target_tf)
 
         self.viewer.log_state(self.state_0)
@@ -579,14 +631,17 @@ class Example:
                 f"identified target_ke not applied to {name}"
             )
 
-        # without key input the target stays at the initial pose, so the
-        # gripper must hold position (softer servo gains than the CAD model -> a
-        # looser bound than the nominal teleop)
-        body_q = self.state_0.body_q.numpy()
-        ee_pos = body_q[self.ee_index][:3]
-        target_pos = wp.transform_get_translation(self.target_tf)
-        error = float(wp.length(wp.vec3(*ee_pos) - target_pos))
-        assert error < 0.1, f"end effector must track the target pose, error={error}"
+        # in sinewave mode the arm is deliberately in motion, so only the
+        # keyboard mode can assert that the gripper holds the initial pose
+        if self.mode == "keyboard":
+            # without key input the target stays at the initial pose, so the
+            # gripper must hold position (softer servo gains than the CAD model
+            # -> a looser bound than the nominal teleop)
+            body_q = self.state_0.body_q.numpy()
+            ee_pos = body_q[self.ee_index][:3]
+            target_pos = wp.transform_get_translation(self.target_tf)
+            error = float(wp.length(wp.vec3(*ee_pos) - target_pos))
+            assert error < 0.1, f"end effector must track the target pose, error={error}"
 
     @staticmethod
     def create_parser():
@@ -614,6 +669,24 @@ class Example:
             type=int,
             default=4,
             help="Simulation substeps per control frame, matching the identification setup.",
+        )
+        parser.add_argument(
+            "--mode",
+            choices=("keyboard", "sinewave"),
+            default="keyboard",
+            help="Control mode: keyboard teleop of the gripper target, or an open-loop sine wave on every joint.",
+        )
+        parser.add_argument(
+            "--sine-amplitude",
+            type=float,
+            default=0.3,
+            help="Sine-wave amplitude [rad] per joint (clamped to the joint limits; sinewave mode only).",
+        )
+        parser.add_argument(
+            "--sine-frequency",
+            type=float,
+            default=0.25,
+            help="Sine-wave frequency [Hz] (sinewave mode only).",
         )
         parser.add_argument(
             "--hardware",
