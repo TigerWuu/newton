@@ -502,6 +502,35 @@ add_example_test(
 )
 
 
+class TestRLExamples(unittest.TestCase):
+    pass
+
+
+# without a checkpoint under logs/, these play back a zero policy, so neither
+# rsl_rl nor a prior training run is required
+add_example_test(
+    TestRLExamples,
+    name="rl.example_robot_so101_reach",
+    devices=cuda_test_devices,
+    test_options={"torch_required": True, "num-frames": 100, "num-envs": 8},
+    use_viewer=True,
+)
+add_example_test(
+    TestRLExamples,
+    name="rl.example_robot_so101_cloth",
+    devices=cuda_test_devices,
+    test_options={"torch_required": True, "num-frames": 20, "num-envs": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestRLExamples,
+    name="rl.example_robot_so101_reach_shac",
+    devices=cuda_test_devices,
+    test_options={"torch_required": True, "num-frames": 100, "num-envs": 8},
+    use_viewer=True,
+)
+
+
 class TestAdvancedRobotExamples(unittest.TestCase):
     pass
 
