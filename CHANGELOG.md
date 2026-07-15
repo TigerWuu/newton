@@ -20,6 +20,9 @@
 - Add `newton.actuators.SchemaNames` exposing the canonical USD schema token constants used by `parse_actuator_prim` for actuator USD parsing
 - Parse URDF `<material>` colors (inline `<color rgba>` and named material references) during import and apply them to `ModelBuilder.shape_color` for all shape types
 - Add robotics tutorial notebook covering ModelBuilder, solvers, CUDA graphs, IK, and pick-and-place
+- Add `robot_so101_reach` and `robot_so101_cloth` examples that train SO-101 arm policies with rsl_rl PPO on replicated worlds
+- Add `robot_so101_reach_shac` example training the SO-101 reach task with Short-Horizon Actor-Critic (SHAC) by backpropagating through `SolverFeatherstone`
+- Add `newton.examples.rl.so101_real2sim_loop` orchestrating iterated SO-101 system identification and SHAC policy training on policy rollouts, with a hardware-free virtual-real-arm mode
 - Add `diffsim_so101_sysid` example identifying SO-ARM101 link masses and inertias and joint damping and friction from recorded trajectories by differentiating through `SolverFeatherstone`
 - Add opt-in `collapse_massless_fixed_root` to URDF and MJCF importers to collapse massless fixed-root chains for maximal-coordinate solvers while preserving topology by default
 - Add USD parsing for `NewtonSiteAPI` to mark shapes as sites.
