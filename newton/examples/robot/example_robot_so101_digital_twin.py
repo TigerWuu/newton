@@ -100,7 +100,7 @@ JOINT_SIGN = dict.fromkeys(USD_JOINT_TO_MOTOR, +1.0)
 JOINT_OFFSET_RAD = dict.fromkeys(USD_JOINT_TO_MOTOR, 0.0)
 
 
-def find_latest_identified_csv(plot_dir="plot"):
+def find_latest_identified_csv(plot_dir="logs/sysid"):
     """Return the most recent ``identified_parameters.csv`` under ``plot_dir``.
 
     The system-identification example writes one CSV per run into a
@@ -655,7 +655,7 @@ class Example:
         parser.add_argument(
             "--plot-dir",
             type=str,
-            default="plot",
+            default="logs/sysid",
             help="Directory searched for the latest identified_parameters.csv.",
         )
         parser.add_argument(
