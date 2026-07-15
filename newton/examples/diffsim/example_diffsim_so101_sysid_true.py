@@ -974,7 +974,7 @@ class Example:
         parser.add_argument(
             "--plot-dir",
             type=str,
-            default="plot",
+            default="logs/sysid",
             help="Directory the trajectory plots are written to.",
         )
         parser.add_argument(
