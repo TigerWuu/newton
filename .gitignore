@@ -74,5 +74,5 @@ docs/_static/viser/
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
 
-# plot
-plot/
+# logs
+logs/
