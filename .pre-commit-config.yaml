@@ -14,6 +14,10 @@ ci:
 
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
+
+# vendored third-party code, kept close to upstream (see ORIGIN.md there)
+exclude: ^newton/_src/rl/rsl_rl/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
